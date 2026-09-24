@@ -432,10 +432,37 @@ fix_resolved() {
 # The http block NEVER binds 443 publicly — it only listens on 127.0.0.1:8443.
 # The stream block handles ALL public port 443 traffic via SNI routing.
 #
+detect_ipv4_resolvers() {
+    local resolver_file resolver_ip
+    local -a resolver_files=() resolvers=()
+
+    # Prefer the upstream servers maintained by systemd-resolved. Its local
+    # 127.0.0.53 stub is disabled during installation to free port 53.
+    for resolver_file in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
+        [[ -r "$resolver_file" ]] && resolver_files+=("$resolver_file")
+    done
+
+    if ((${#resolver_files[@]})); then
+        while IFS= read -r resolver_ip; do
+            [[ "$resolver_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+            [[ "$resolver_ip" == 127.* ]] && continue
+            domain_exists "$resolver_ip" "${resolvers[@]}" || resolvers+=("$resolver_ip")
+        done < <(awk '$1 == "nameserver" { print $2 }' "${resolver_files[@]}")
+    fi
+
+    # Public resolvers are only a fallback when the host exposes no upstream
+    # IPv4 resolver. Some providers block direct DNS, hence host DNS comes first.
+    ((${#resolvers[@]})) || resolvers=(1.1.1.1 8.8.8.8)
+    printf '%s ' "${resolvers[@]}"
+}
+
 generate_angie_conf() {
     print_step "Generating Angie configuration"
 
     mkdir -p "$ANGIE_STREAM_DIR" "$ANGIE_HTTP_DIR" /var/log/angie /var/lib/angie/acme
+
+    local angie_resolvers
+    angie_resolvers="$(detect_ipv4_resolvers)"
 
     # ── main angie.conf ────────────────────────────────────────────────────
     cat > "$ANGIE_CONF" <<ANGIEEOF
@@ -485,27 +512,23 @@ stream {
 }
 ANGIEEOF
 
-    # ── Append ACME block if domain provided ──────────────────────────────
-    if [[ -n "$DOT_DOMAIN" ]]; then
-        cat >> "$ANGIE_CONF" <<ACMEEOF
-
-# Let's Encrypt via Angie built-in ACME client
-acme {
-    client letsencrypt {
-        directory https://acme-v02.api.letsencrypt.org/directory;
-        email     ${ACME_EMAIL};
-    }
-
-    certificate ${DOT_DOMAIN} {
-        client  letsencrypt;
-        domains ${DOT_DOMAIN};
-        webroot /var/lib/angie/acme;
-    }
-}
-ACMEEOF
-    fi
-
     print_ok "Written: ${ANGIE_CONF}"
+
+    # ── ACME client (included from the http context) ──────────────────────
+    if [[ -n "$DOT_DOMAIN" ]]; then
+        cat > "${ANGIE_HTTP_DIR}/00-acme-client.conf" <<ACMEEOF
+# Angie built-in ACME client. IPv6 is disabled because many IPv4-only VPSes
+# resolve the CA's AAAA record but cannot connect to it.
+resolver ${angie_resolvers}ipv6=off valid=300s;
+resolver_timeout 5s;
+
+acme_client letsencrypt https://acme-v02.api.letsencrypt.org/directory
+    email=${ACME_EMAIL};
+ACMEEOF
+        print_ok "Written: ${ANGIE_HTTP_DIR}/00-acme-client.conf"
+    else
+        rm -f "${ANGIE_HTTP_DIR}/00-acme-client.conf"
+    fi
 
     # ── Stream block ───────────────────────────────────────────────────────
     if [[ -n "$DOT_DOMAIN" ]]; then
@@ -533,8 +556,11 @@ server {
 # DNS-over-TLS (853): terminates TLS, proxies plain DNS to Blocky on 53
 server {
     listen     853 ssl;
-    ssl_certificate     /etc/angie/acme/${DOT_DOMAIN}/fullchain.cer;
-    ssl_certificate_key /etc/angie/acme/${DOT_DOMAIN}/${DOT_DOMAIN}.key;
+    server_name ${DOT_DOMAIN};
+    acme letsencrypt;
+
+    ssl_certificate     \$acme_cert_letsencrypt;
+    ssl_certificate_key \$acme_cert_key_letsencrypt;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
     ssl_session_cache   shared:DoT:4m;
@@ -565,16 +591,13 @@ STREAMEOF
     # ── HTTP block ─────────────────────────────────────────────────────────
     if [[ -n "$DOT_DOMAIN" ]]; then
         cat > "${ANGIE_HTTP_DIR}/local-services.conf" <<HTTPEOF
-# Port 80: redirect to HTTPS + ACME challenge
+# Port 80: Angie intercepts the built-in ACME HTTP challenge; reject the rest.
 server {
     listen 80;
     server_name ${DOT_DOMAIN};
+    acme letsencrypt;
 
-    location /.well-known/acme-challenge/ {
-        root /var/lib/angie/acme;
-        try_files \$uri =404;
-    }
-    location / { return 301 https://\$host\$request_uri; }
+    return 444;
 }
 
 # Internal HTTPS on 127.0.0.1:8443 — reached via stream SNI map on port 443
@@ -583,8 +606,8 @@ server {
     listen 127.0.0.1:8443 ssl;
     server_name ${DOT_DOMAIN};
 
-    ssl_certificate     /etc/angie/acme/${DOT_DOMAIN}/fullchain.cer;
-    ssl_certificate_key /etc/angie/acme/${DOT_DOMAIN}/${DOT_DOMAIN}.key;
+    ssl_certificate     \$acme_cert_letsencrypt;
+    ssl_certificate_key \$acme_cert_key_letsencrypt;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
